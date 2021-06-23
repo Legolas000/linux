@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * This header file contains public constants and structures used by
  * the SCSI initiator code.
@@ -18,25 +19,6 @@ enum scsi_timeouts {
 };
 
 /*
- * The maximum number of SG segments that we will put inside a
- * scatterlist (unless chaining is used). Should ideally fit inside a
- * single page, to avoid a higher order allocation.  We could define this
- * to SG_MAX_SINGLE_ALLOC to pack correctly at the highest order.  The
- * minimum value is 32
- */
-#define SCSI_MAX_SG_SEGMENTS	128
-
-/*
- * Like SCSI_MAX_SG_SEGMENTS, but for archs that have sg chaining. This limit
- * is totally arbitrary, a setting of 2048 will get you at least 8mb ios.
- */
-#ifdef CONFIG_ARCH_HAS_SG_CHAIN
-#define SCSI_MAX_SG_CHAIN_SEGMENTS	2048
-#else
-#define SCSI_MAX_SG_CHAIN_SEGMENTS	SCSI_MAX_SG_SEGMENTS
-#endif
-
-/*
  * DIX-capable adapters effectively support infinite chaining for the
  * protection information scatterlist
  */
@@ -47,16 +29,6 @@ enum scsi_timeouts {
  * possible channels, (target) ids, or luns on a given shost.
  */
 #define SCAN_WILD_CARD	~0
-
-#ifdef CONFIG_ACPI
-struct acpi_bus_type;
-
-extern int
-scsi_register_acpi_bus_type(struct acpi_bus_type *bus);
-
-extern void
-scsi_unregister_acpi_bus_type(struct acpi_bus_type *bus);
-#endif
 
 /** scsi_status_is_good - check the status return.
  *
@@ -75,6 +47,8 @@ static inline int scsi_status_is_good(int status)
 	 */
 	status &= 0xfe;
 	return ((status == SAM_STAT_GOOD) ||
+		(status == SAM_STAT_CONDITION_MET) ||
+		/* Next two "intermediate" statuses are obsolete in SAM-4 */
 		(status == SAM_STAT_INTERMEDIATE) ||
 		(status == SAM_STAT_INTERMEDIATE_CONDITION_MET) ||
 		/* FIXME: this is obsolete in SAM-3 */
@@ -142,6 +116,7 @@ static inline int scsi_is_wlun(u64 lun)
 #define CLEAR_TASK_SET      0x0e
 #define INITIATE_RECOVERY   0x0f            /* SCSI-II only */
 #define RELEASE_RECOVERY    0x10            /* SCSI-II only */
+#define TERMINATE_IO_PROC   0x11            /* SCSI-II only */
 #define CLEAR_ACA           0x16
 #define LOGICAL_UNIT_RESET  0x17
 #define SIMPLE_QUEUE_TAG    0x20
@@ -185,6 +160,7 @@ static inline int scsi_is_wlun(u64 lun)
 				 * paths might yield different results */
 #define DID_ALLOC_FAILURE 0x12  /* Space allocation on the device failed */
 #define DID_MEDIUM_ERROR  0x13  /* Medium error */
+#define DID_TRANSPORT_MARGINAL 0x14 /* Transport marginal errors */
 #define DRIVER_OK       0x00	/* Driver status                           */
 
 /*
@@ -204,16 +180,17 @@ static inline int scsi_is_wlun(u64 lun)
 /*
  * Internal return values.
  */
-
-#define NEEDS_RETRY     0x2001
-#define SUCCESS         0x2002
-#define FAILED          0x2003
-#define QUEUED          0x2004
-#define SOFT_ERROR      0x2005
-#define ADD_TO_MLQUEUE  0x2006
-#define TIMEOUT_ERROR   0x2007
-#define SCSI_RETURN_NOT_HANDLED   0x2008
-#define FAST_IO_FAIL	0x2009
+enum scsi_disposition {
+	NEEDS_RETRY		= 0x2001,
+	SUCCESS			= 0x2002,
+	FAILED			= 0x2003,
+	QUEUED			= 0x2004,
+	SOFT_ERROR		= 0x2005,
+	ADD_TO_MLQUEUE		= 0x2006,
+	TIMEOUT_ERROR		= 0x2007,
+	SCSI_RETURN_NOT_HANDLED	= 0x2008,
+	FAST_IO_FAIL		= 0x2009,
+};
 
 /*
  * Midlevel queue return values.
@@ -299,11 +276,5 @@ static inline int scsi_is_wlun(u64 lun)
 
 /* Used to obtain the PCI location of a device */
 #define SCSI_IOCTL_GET_PCI		0x5387
-
-/* Pull a u32 out of a SCSI message (using BE SCSI conventions) */
-static inline __u32 scsi_to_u32(__u8 *ptr)
-{
-	return (ptr[0]<<24) + (ptr[1]<<16) + (ptr[2]<<8) + ptr[3];
-}
 
 #endif /* _SCSI_SCSI_H */

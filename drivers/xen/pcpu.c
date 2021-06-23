@@ -78,7 +78,7 @@ static int xen_pcpu_down(uint32_t cpu_id)
 		.u.cpu_ol.cpuid		= cpu_id,
 	};
 
-	return HYPERVISOR_dom0_op(&op);
+	return HYPERVISOR_platform_op(&op);
 }
 
 static int xen_pcpu_up(uint32_t cpu_id)
@@ -89,7 +89,7 @@ static int xen_pcpu_up(uint32_t cpu_id)
 		.u.cpu_ol.cpuid		= cpu_id,
 	};
 
-	return HYPERVISOR_dom0_op(&op);
+	return HYPERVISOR_platform_op(&op);
 }
 
 static ssize_t show_online(struct device *dev,
@@ -277,7 +277,7 @@ static int sync_pcpu(uint32_t cpu, uint32_t *max_cpu)
 		.u.pcpu_info.xen_cpuid = cpu,
 	};
 
-	ret = HYPERVISOR_dom0_op(&op);
+	ret = HYPERVISOR_platform_op(&op);
 	if (ret)
 		return ret;
 
@@ -344,41 +344,6 @@ static irqreturn_t xen_pcpu_interrupt(int irq, void *dev_id)
 	schedule_work(&xen_pcpu_work);
 	return IRQ_HANDLED;
 }
-
-/* Sync with Xen hypervisor after cpu hotadded */
-void xen_pcpu_hotplug_sync(void)
-{
-	schedule_work(&xen_pcpu_work);
-}
-EXPORT_SYMBOL_GPL(xen_pcpu_hotplug_sync);
-
-/*
- * For hypervisor presented cpu, return logic cpu id;
- * For hypervisor non-presented cpu, return -ENODEV.
- */
-int xen_pcpu_id(uint32_t acpi_id)
-{
-	int cpu_id = 0, max_id = 0;
-	struct xen_platform_op op;
-
-	op.cmd = XENPF_get_cpuinfo;
-	while (cpu_id <= max_id) {
-		op.u.pcpu_info.xen_cpuid = cpu_id;
-		if (HYPERVISOR_dom0_op(&op)) {
-			cpu_id++;
-			continue;
-		}
-
-		if (acpi_id == op.u.pcpu_info.acpi_id)
-			return cpu_id;
-		if (op.u.pcpu_info.max_present > max_id)
-			max_id = op.u.pcpu_info.max_present;
-		cpu_id++;
-	}
-
-	return -ENODEV;
-}
-EXPORT_SYMBOL_GPL(xen_pcpu_id);
 
 static int __init xen_pcpu_init(void)
 {

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  The NFC Controller Interface is the communication protocol between an
  *  NFC Controller (NFCC) and a Device Host (DH).
@@ -10,19 +11,6 @@
  *  Acknowledgements:
  *  This file is based on hci_core.c, which was written
  *  by Maxim Krasnyansky.
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License version 2
- *  as published by the Free Software Foundation
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, see <http://www.gnu.org/licenses/>.
- *
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": %s: " fmt, __func__
@@ -64,18 +52,25 @@ struct nci_conn_info *nci_get_conn_info_by_conn_id(struct nci_dev *ndev,
 	return NULL;
 }
 
-int nci_get_conn_info_by_id(struct nci_dev *ndev, u8 id)
+int nci_get_conn_info_by_dest_type_params(struct nci_dev *ndev, u8 dest_type,
+					  struct dest_spec_params *params)
 {
 	struct nci_conn_info *conn_info;
 
 	list_for_each_entry(conn_info, &ndev->conn_info_list, list) {
-		if (conn_info->id == id)
-			return conn_info->conn_id;
+		if (conn_info->dest_type == dest_type) {
+			if (!params)
+				return conn_info->conn_id;
+
+			if (params->id == conn_info->dest_params->id &&
+			    params->protocol == conn_info->dest_params->protocol)
+				return conn_info->conn_id;
+		}
 	}
 
 	return -EINVAL;
 }
-EXPORT_SYMBOL(nci_get_conn_info_by_id);
+EXPORT_SYMBOL(nci_get_conn_info_by_dest_type_params);
 
 /* ---- NCI requests ---- */
 
@@ -170,7 +165,12 @@ static void nci_reset_req(struct nci_dev *ndev, unsigned long opt)
 
 static void nci_init_req(struct nci_dev *ndev, unsigned long opt)
 {
-	nci_send_cmd(ndev, NCI_OP_CORE_INIT_CMD, 0, NULL);
+	u8 plen = 0;
+
+	if (opt)
+		plen = sizeof(struct nci_core_init_v2_cmd);
+
+	nci_send_cmd(ndev, NCI_OP_CORE_INIT_CMD, plen, (void *)opt);
 }
 
 static void nci_init_complete_req(struct nci_dev *ndev, unsigned long opt)
@@ -392,6 +392,83 @@ int nci_core_init(struct nci_dev *ndev)
 }
 EXPORT_SYMBOL(nci_core_init);
 
+struct nci_loopback_data {
+	u8 conn_id;
+	struct sk_buff *data;
+};
+
+static void nci_send_data_req(struct nci_dev *ndev, unsigned long opt)
+{
+	struct nci_loopback_data *data = (struct nci_loopback_data *)opt;
+
+	nci_send_data(ndev, data->conn_id, data->data);
+}
+
+static void nci_nfcc_loopback_cb(void *context, struct sk_buff *skb, int err)
+{
+	struct nci_dev *ndev = (struct nci_dev *)context;
+	struct nci_conn_info    *conn_info;
+
+	conn_info = nci_get_conn_info_by_conn_id(ndev, ndev->cur_conn_id);
+	if (!conn_info) {
+		nci_req_complete(ndev, NCI_STATUS_REJECTED);
+		return;
+	}
+
+	conn_info->rx_skb = skb;
+
+	nci_req_complete(ndev, NCI_STATUS_OK);
+}
+
+int nci_nfcc_loopback(struct nci_dev *ndev, void *data, size_t data_len,
+		      struct sk_buff **resp)
+{
+	int r;
+	struct nci_loopback_data loopback_data;
+	struct nci_conn_info *conn_info;
+	struct sk_buff *skb;
+	int conn_id = nci_get_conn_info_by_dest_type_params(ndev,
+					NCI_DESTINATION_NFCC_LOOPBACK, NULL);
+
+	if (conn_id < 0) {
+		r = nci_core_conn_create(ndev, NCI_DESTINATION_NFCC_LOOPBACK,
+					 0, 0, NULL);
+		if (r != NCI_STATUS_OK)
+			return r;
+
+		conn_id = nci_get_conn_info_by_dest_type_params(ndev,
+					NCI_DESTINATION_NFCC_LOOPBACK,
+					NULL);
+	}
+
+	conn_info = nci_get_conn_info_by_conn_id(ndev, conn_id);
+	if (!conn_info)
+		return -EPROTO;
+
+	/* store cb and context to be used on receiving data */
+	conn_info->data_exchange_cb = nci_nfcc_loopback_cb;
+	conn_info->data_exchange_cb_context = ndev;
+
+	skb = nci_skb_alloc(ndev, NCI_DATA_HDR_SIZE + data_len, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+
+	skb_reserve(skb, NCI_DATA_HDR_SIZE);
+	skb_put_data(skb, data, data_len);
+
+	loopback_data.conn_id = conn_id;
+	loopback_data.data = skb;
+
+	ndev->cur_conn_id = conn_id;
+	r = nci_request(ndev, nci_send_data_req, (unsigned long)&loopback_data,
+			msecs_to_jiffies(NCI_DATA_TIMEOUT));
+	if (r == NCI_STATUS_OK && resp)
+		*resp = conn_info->rx_skb;
+
+	return r;
+}
+EXPORT_SYMBOL(nci_nfcc_loopback);
+
 static int nci_open_device(struct nci_dev *ndev)
 {
 	int rc = 0;
@@ -425,7 +502,16 @@ static int nci_open_device(struct nci_dev *ndev)
 	}
 
 	if (!rc) {
-		rc = __nci_request(ndev, nci_init_req, 0,
+		struct nci_core_init_v2_cmd nci_init_v2_cmd = {
+			.feature1 = NCI_FEATURE_DISABLE,
+			.feature2 = NCI_FEATURE_DISABLE
+		};
+		unsigned long opt = 0;
+
+		if (ndev->nci_ver & NCI_VER_2_MASK)
+			opt = (unsigned long)&nci_init_v2_cmd;
+
+		rc = __nci_request(ndev, nci_init_req, opt,
 				   msecs_to_jiffies(NCI_INIT_TIMEOUT));
 	}
 
@@ -493,10 +579,10 @@ static int nci_close_device(struct nci_dev *ndev)
 
 	clear_bit(NCI_INIT, &ndev->flags);
 
-	del_timer_sync(&ndev->cmd_timer);
-
 	/* Flush cmd wq */
 	flush_workqueue(ndev->cmd_wq);
+
+	del_timer_sync(&ndev->cmd_timer);
 
 	/* Clear flags */
 	ndev->flags = 0;
@@ -507,18 +593,18 @@ static int nci_close_device(struct nci_dev *ndev)
 }
 
 /* NCI command timer function */
-static void nci_cmd_timer(unsigned long arg)
+static void nci_cmd_timer(struct timer_list *t)
 {
-	struct nci_dev *ndev = (void *) arg;
+	struct nci_dev *ndev = from_timer(ndev, t, cmd_timer);
 
 	atomic_set(&ndev->cmd_cnt, 1);
 	queue_work(ndev->cmd_wq, &ndev->cmd_work);
 }
 
 /* NCI data exchange timer function */
-static void nci_data_timer(unsigned long arg)
+static void nci_data_timer(struct timer_list *t)
 {
-	struct nci_dev *ndev = (void *) arg;
+	struct nci_dev *ndev = from_timer(ndev, t, data_timer);
 
 	set_bit(NCI_DATA_EXCHANGE_TO, &ndev->flags);
 	queue_work(ndev->rx_wq, &ndev->rx_work);
@@ -615,22 +701,25 @@ int nci_core_conn_create(struct nci_dev *ndev, u8 destination_type,
 	if (!cmd)
 		return -ENOMEM;
 
-	if (!number_destination_params)
-		return -EINVAL;
-
 	cmd->destination_type = destination_type;
 	cmd->number_destination_params = number_destination_params;
-	memcpy(cmd->params, params, params_len);
 
 	data.cmd = cmd;
 
-	if (params->length > 0)
-		ndev->cur_id = params->value[DEST_SPEC_PARAMS_ID_INDEX];
-	else
-		ndev->cur_id = 0;
+	if (params) {
+		memcpy(cmd->params, params, params_len);
+		if (params->length > 0)
+			memcpy(&ndev->cur_params,
+			       &params->value[DEST_SPEC_PARAMS_ID_INDEX],
+			       sizeof(struct dest_spec_params));
+		else
+			ndev->cur_params.id = 0;
+	} else {
+		ndev->cur_params.id = 0;
+	}
+	ndev->cur_dest_type = destination_type;
 
-	r = __nci_request(ndev, nci_core_conn_create_req,
-			  (unsigned long)&data,
+	r = __nci_request(ndev, nci_core_conn_create_req, (unsigned long)&data,
 			  msecs_to_jiffies(NCI_CMD_TIMEOUT));
 	kfree(cmd);
 	return r;
@@ -646,6 +735,7 @@ static void nci_core_conn_close_req(struct nci_dev *ndev, unsigned long opt)
 
 int nci_core_conn_close(struct nci_dev *ndev, u8 conn_id)
 {
+	ndev->cur_conn_id = conn_id;
 	return __nci_request(ndev, nci_core_conn_close_req, conn_id,
 			     msecs_to_jiffies(NCI_CMD_TIMEOUT));
 }
@@ -1036,6 +1126,8 @@ static struct nfc_ops nci_nfc_ops = {
  *
  * @ops: device operations
  * @supported_protocols: NFC protocols supported by the device
+ * @tx_headroom: Reserved space at beginning of skb
+ * @tx_tailroom: Reserved space at end of skb
  */
 struct nci_dev *nci_allocate_device(struct nci_ops *ops,
 				    __u32 supported_protocols,
@@ -1084,8 +1176,7 @@ struct nci_dev *nci_allocate_device(struct nci_ops *ops,
 	return ndev;
 
 free_nfc:
-	kfree(ndev->nfc_dev);
-
+	nfc_free_device(ndev->nfc_dev);
 free_nci:
 	kfree(ndev);
 	return NULL;
@@ -1100,6 +1191,7 @@ EXPORT_SYMBOL(nci_allocate_device);
 void nci_free_device(struct nci_dev *ndev)
 {
 	nfc_free_device(ndev->nfc_dev);
+	nci_hci_deallocate(ndev);
 	kfree(ndev);
 }
 EXPORT_SYMBOL(nci_free_device);
@@ -1107,7 +1199,7 @@ EXPORT_SYMBOL(nci_free_device);
 /**
  * nci_register_device - register a nci device in the nfc subsystem
  *
- * @dev: The nci device to register
+ * @ndev: The nci device to register
  */
 int nci_register_device(struct nci_dev *ndev)
 {
@@ -1145,19 +1237,20 @@ int nci_register_device(struct nci_dev *ndev)
 	skb_queue_head_init(&ndev->rx_q);
 	skb_queue_head_init(&ndev->tx_q);
 
-	setup_timer(&ndev->cmd_timer, nci_cmd_timer,
-		    (unsigned long) ndev);
-	setup_timer(&ndev->data_timer, nci_data_timer,
-		    (unsigned long) ndev);
+	timer_setup(&ndev->cmd_timer, nci_cmd_timer, 0);
+	timer_setup(&ndev->data_timer, nci_data_timer, 0);
 
 	mutex_init(&ndev->req_lock);
 	INIT_LIST_HEAD(&ndev->conn_info_list);
 
 	rc = nfc_register_device(ndev->nfc_dev);
 	if (rc)
-		goto destroy_rx_wq_exit;
+		goto destroy_tx_wq_exit;
 
 	goto exit;
+
+destroy_tx_wq_exit:
+	destroy_workqueue(ndev->tx_wq);
 
 destroy_rx_wq_exit:
 	destroy_workqueue(ndev->rx_wq);
@@ -1173,7 +1266,7 @@ EXPORT_SYMBOL(nci_register_device);
 /**
  * nci_unregister_device - unregister a nci device in the nfc subsystem
  *
- * @dev: The nci device to unregister
+ * @ndev: The nci device to unregister
  */
 void nci_unregister_device(struct nci_dev *ndev)
 {
@@ -1252,7 +1345,7 @@ int nci_send_cmd(struct nci_dev *ndev, __u16 opcode, __u8 plen, void *payload)
 		return -ENOMEM;
 	}
 
-	hdr = (struct nci_ctrl_hdr *) skb_put(skb, NCI_CTRL_HDR_SIZE);
+	hdr = skb_put(skb, NCI_CTRL_HDR_SIZE);
 	hdr->gid = nci_opcode_gid(opcode);
 	hdr->oid = nci_opcode_oid(opcode);
 	hdr->plen = plen;
@@ -1261,7 +1354,7 @@ int nci_send_cmd(struct nci_dev *ndev, __u16 opcode, __u8 plen, void *payload)
 	nci_pbf_set((__u8 *)hdr, NCI_PBF_LAST);
 
 	if (plen)
-		memcpy(skb_put(skb, plen), payload, plen);
+		skb_put_data(skb, payload, plen);
 
 	skb_queue_tail(&ndev->cmd_q, skb);
 	queue_work(ndev->cmd_wq, &ndev->cmd_work);
@@ -1415,7 +1508,7 @@ static void nci_rx_work(struct work_struct *work)
 		}
 	}
 
-	/* check if a data exchange timout has occurred */
+	/* check if a data exchange timeout has occurred */
 	if (test_bit(NCI_DATA_EXCHANGE_TO, &ndev->flags)) {
 		/* complete the data exchange transaction, if exists */
 		if (test_bit(NCI_DATA_EXCHANGE, &ndev->flags))
